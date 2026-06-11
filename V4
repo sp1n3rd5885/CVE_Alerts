@@ -1,0 +1,405 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const SEVERITIES = ["ALL", "CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"];
+const RANGES = [
+  { label: "24h", days: 1 },
+  { label: "48h", days: 2 },
+  { label: "7d", days: 7 },
+  { label: "14d", days: 14 },
+];
+const SORTS = [
+  { label: "Newest", value: "date-desc" },
+  { label: "Oldest", value: "date-asc" },
+  { label: "Score â†“", value: "score-desc" },
+  { label: "Score â†‘", value: "score-asc" },
+];
+
+const SEV_COLORS = {
+  CRITICAL: { border: "#ff4d4d", badge: "rgba(255,77,77,0.15)", text: "#ff7070" },
+  HIGH:     { border: "#f0883e", badge: "rgba(240,136,62,0.15)", text: "#f0a060" },
+  MEDIUM:   { border: "#e3b341", badge: "rgba(227,179,65,0.15)", text: "#e3c040" },
+  LOW:      { border: "#3fb950", badge: "rgba(63,185,80,0.15)",  text: "#3fb950" },
+  UNKNOWN:  { border: "#6e7681", badge: "rgba(110,118,129,0.15)", text: "#8b949e" },
+};
+
+function getSeverity(cve) {
+  const m = cve.metrics?.cvssMetricV40?.[0]
+         || cve.metrics?.cvssMetricV31?.[0]
+         || cve.metrics?.cvssMetricV30?.[0];
+  if (m) return { severity: m.cvssData.baseSeverity, score: m.cvssData.baseScore };
+  return { severity: "UNKNOWN", score: null };
+}
+
+function CVECard({ item }) {
+  const [expanded, setExpanded] = useState(false);
+  const cve = item.cve;
+  const id = cve.id;
+  const { severity, score } = getSeverity(cve);
+  const descObj = cve.descriptions.find(d => d.lang === "en");
+  const description = descObj?.value || "No description provided.";
+  const dateStr = new Date(cve.published).toLocaleDateString(undefined, {
+    year: "numeric", month: "short", day: "numeric",
+  });
+  const scoreLabel = score != null ? score.toFixed(1) : "N/A";
+  const colors = SEV_COLORS[severity] || SEV_COLORS.UNKNOWN;
+  const needsTrunc = description.length > 280;
+
+  return (
+    <div style={{
+      background: "#161b22",
+      borderRadius: 10,
+      padding: "14px 16px",
+      marginBottom: 10,
+      borderLeft: `5px solid ${colors.border}`,
+      boxShadow: "0 2px 8px rgba(0,0,0,0.35)",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
+        <a
+          href={`https://nvd.nist.gov/vuln/detail/${id}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ fontWeight: 700, color: "#388bfd", textDecoration: "none", fontSize: "0.98rem" }}
+        >
+          {id}
+        </a>
+        <span style={{
+          fontSize: "0.73rem", fontWeight: 700, padding: "3px 9px",
+          borderRadius: 20, whiteSpace: "nowrap", flexShrink: 0,
+          background: colors.badge, color: colors.text,
+        }}>
+          {severity} {scoreLabel}
+        </span>
+      </div>
+
+      <p style={{
+        margin: 0,
+        fontSize: "0.875rem",
+        color: "#c9d1d9",
+        lineHeight: 1.6,
+        display: "-webkit-box",
+        WebkitLineClamp: expanded ? "unset" : (needsTrunc ? 3 : "unset"),
+        WebkitBoxOrient: "vertical",
+        overflow: expanded ? "visible" : (needsTrunc ? "hidden" : "visible"),
+      }}>
+        {description}
+      </p>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10 }}>
+        {needsTrunc ? (
+          <button
+            onClick={() => setExpanded(e => !e)}
+            style={{ background: "none", border: "none", color: "#388bfd", fontSize: "0.78rem", cursor: "pointer", padding: 0 }}
+          >
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        ) : <span />}
+        <span style={{ fontSize: "0.78rem", color: "#7d8590" }}>Published {dateStr}</span>
+      </div>
+    </div>
+  );
+}
+
+export default function CVEMonitor() {
+  const [allCves, setAllCves] = useState([]);
+  const [filtered, setFiltered] = useState([]);
+  const [status, setStatus] = useState("idle"); // idle | loading | error
+  const [errorMsg, setErrorMsg] = useState("");
+  const [retryIn, setRetryIn] = useState(null);
+
+  const [search, setSearch] = useState("");
+  const [activeSev, setActiveSev] = useState("ALL");
+  const [sort, setSort] = useState("date-desc");
+  const [rangeDays, setRangeDays] = useState(2);
+
+  const debounceRef = useRef(null);
+  const retryRef = useRef(null);
+
+  // â”€â”€ Fetch via Claude API (no CORS issues) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const fetchCVEs = useCallback(async () => {
+    clearInterval(retryRef.current);
+    setRetryIn(null);
+    setStatus("loading");
+    setAllCves([]);
+    setFiltered([]);
+    setErrorMsg("");
+
+    const from = new Date(Date.now() - rangeDays * 86400000);
+    const now  = new Date();
+    const fmt  = d => d.toISOString().split(".")[0];
+    const url  = `https://services.nvd.nist.gov/rest/json/cves/2.0/?pubStartDate=${fmt(from)}&pubEndDate=${fmt(now)}`;
+
+    const prompt = `Fetch this URL and return ONLY the raw JSON response body, nothing else, no markdown:
+${url}`;
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+
+      const data = await res.json();
+
+      // Extract text from all content blocks
+      const fullText = (data.content || [])
+        .map(b => b.type === "text" ? b.text : "")
+        .join("");
+
+      // Pull out JSON â€” strip markdown fences if present
+      const cleaned = fullText.replace(/```json|```/gi, "").trim();
+
+      // Find the JSON object in the response
+      const jsonStart = cleaned.indexOf("{");
+      const jsonEnd   = cleaned.lastIndexOf("}");
+      if (jsonStart === -1 || jsonEnd === -1) throw new Error("No JSON found in response.");
+
+      const parsed = JSON.parse(cleaned.slice(jsonStart, jsonEnd + 1));
+
+      if (parsed.message?.includes("403") || parsed.message?.includes("429") || parsed.status === 403) {
+        throw new RateLimitError();
+      }
+
+      const vulns = parsed.vulnerabilities || [];
+      setAllCves(vulns);
+      setStatus("idle");
+    } catch (err) {
+      setStatus("error");
+      if (err instanceof RateLimitError) {
+        setErrorMsg("NVD API rate limit reached.");
+        startRetryCountdown(60);
+      } else {
+        setErrorMsg(err.message || "Failed to fetch CVEs.");
+      }
+    }
+  }, [rangeDays]);
+
+  class RateLimitError extends Error {}
+
+  function startRetryCountdown(seconds) {
+    setRetryIn(seconds);
+    retryRef.current = setInterval(() => {
+      setRetryIn(prev => {
+        if (prev <= 1) {
+          clearInterval(retryRef.current);
+          fetchCVEs();
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }
+
+  // â”€â”€ Filter + sort whenever deps change â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => {
+    const q = search.toLowerCase().trim();
+    let results = allCves.filter(item => {
+      const cve = item.cve;
+      const { severity } = getSeverity(cve);
+      if (activeSev !== "ALL" && severity !== activeSev) return false;
+      if (q) {
+        const id   = cve.id.toLowerCase();
+        const desc = (cve.descriptions.find(d => d.lang === "en")?.value || "").toLowerCase();
+        if (!id.includes(q) && !desc.includes(q)) return false;
+      }
+      return true;
+    });
+
+    results = [...results].sort((a, b) => {
+      if (sort === "date-desc") return new Date(b.cve.published) - new Date(a.cve.published);
+      if (sort === "date-asc")  return new Date(a.cve.published) - new Date(b.cve.published);
+      const sa = getSeverity(a.cve).score ?? (sort === "score-desc" ? -1 : 99);
+      const sb = getSeverity(b.cve).score ?? (sort === "score-desc" ? -1 : 99);
+      return sort === "score-desc" ? sb - sa : sa - sb;
+    });
+
+    setFiltered(results);
+  }, [allCves, search, activeSev, sort]);
+
+  // Initial fetch
+  useEffect(() => { fetchCVEs(); }, [fetchCVEs]);
+
+  // Debounced search
+  const handleSearch = e => {
+    const val = e.target.value;
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => setSearch(val), 280);
+  };
+
+  const isLoading = status === "loading";
+
+  return (
+    <div style={{
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      background: "#0d1117",
+      minHeight: "100vh",
+      color: "#e6edf3",
+      padding: "20px 16px 48px",
+      maxWidth: 820,
+      margin: "0 auto",
+    }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", paddingBottom: 14, borderBottom: "1px solid #30363d", marginBottom: 16 }}>
+        <div>
+          <h2 style={{ margin: "0 0 3px", fontSize: "1.25rem", letterSpacing: "-0.02em" }}>âš ï¸ CVE Monitor</h2>
+          <div style={{ fontSize: "0.78rem", color: "#7d8590", minHeight: "1.1em" }}>
+            {isLoading ? "Fetchingâ€¦" : status === "idle" ? (allCves.length > 0 ? `${filtered.length.toLocaleString()} of ${allCves.length.toLocaleString()} CVEs` : "") : ""}
+          </div>
+        </div>
+        <button
+          onClick={fetchCVEs}
+          disabled={isLoading}
+          style={{
+            display: "flex", alignItems: "center", gap: 7,
+            background: "#21262d", color: "#e6edf3",
+            border: "1px solid #30363d", padding: "8px 14px",
+            borderRadius: 8, fontWeight: 600, fontSize: "0.875rem",
+            cursor: isLoading ? "not-allowed" : "pointer",
+            opacity: isLoading ? 0.5 : 1, whiteSpace: "nowrap",
+          }}
+        >
+          {isLoading ? (
+            <svg width="13" height="13" viewBox="0 0 13 13" style={{ animation: "spin 0.7s linear infinite" }}>
+              <circle cx="6.5" cy="6.5" r="5" fill="none" stroke="#7d8590" strokeWidth="2" strokeDasharray="20 10" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+              <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+            </svg>
+          )}
+          Refresh
+        </button>
+      </div>
+
+      {/* Controls */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+        <input
+          type="text"
+          placeholder="Search CVE ID, software, vendor, keywordâ€¦"
+          onChange={handleSearch}
+          autoComplete="off"
+          spellCheck="false"
+          style={{
+            width: "100%", padding: "10px 14px", background: "#161b22",
+            border: "1px solid #30363d", borderRadius: 8, color: "#e6edf3",
+            fontSize: "0.95rem", outline: "none", boxSizing: "border-box",
+          }}
+        />
+
+        {/* Severity chips + sort/range */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 7, alignItems: "center" }}>
+          {SEVERITIES.map(sev => {
+            const active = activeSev === sev;
+            const col = sev === "ALL" ? { border: "#388bfd", text: "#fff" } : { border: SEV_COLORS[sev]?.border, text: SEV_COLORS[sev]?.text };
+            return (
+              <button
+                key={sev}
+                onClick={() => setActiveSev(sev)}
+                style={{
+                  padding: "4px 12px", borderRadius: 20, fontSize: "0.75rem",
+                  fontWeight: 700, letterSpacing: "0.02em", cursor: "pointer",
+                  border: `1.5px solid ${active ? col.border : "#30363d"}`,
+                  background: active ? (sev === "MEDIUM" || sev === "LOW" ? col.border : col.border) : "#21262d",
+                  color: active ? (sev === "MEDIUM" || sev === "LOW" ? "#0d1117" : "#fff") : "#7d8590",
+                  transition: "all 0.12s",
+                }}
+              >
+                {sev === "ALL" ? "All" : sev.charAt(0) + sev.slice(1).toLowerCase()}
+              </button>
+            );
+          })}
+
+          <div style={{ display: "flex", gap: 7, marginLeft: "auto" }}>
+            {[
+              { id: "range", items: RANGES.map(r => ({ label: r.label, value: r.days })), val: rangeDays, set: v => setRangeDays(Number(v)) },
+              { id: "sort",  items: SORTS.map(s => ({ label: s.label, value: s.value })), val: sort, set: v => setSort(v) },
+            ].map(({ id, items, val, set }) => (
+              <select
+                key={id}
+                value={val}
+                onChange={e => set(e.target.value)}
+                style={{
+                  padding: "5px 10px", background: "#21262d", border: "1px solid #30363d",
+                  borderRadius: 8, color: "#e6edf3", fontSize: "0.8rem", cursor: "pointer", outline: "none",
+                }}
+              >
+                {items.map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+              </select>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Retry bar */}
+      {retryIn !== null && (
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          background: "rgba(255,77,77,0.08)", border: "1px solid rgba(255,77,77,0.25)",
+          borderRadius: 8, padding: "10px 14px", marginBottom: 12,
+          fontSize: "0.85rem", color: "#ff9090", gap: 10,
+        }}>
+          <span>Rate limited â€” auto-retry in {retryIn}s</span>
+          <button
+            onClick={() => { clearInterval(retryRef.current); setRetryIn(null); fetchCVEs(); }}
+            style={{ background: "none", border: "1px solid rgba(255,77,77,0.4)", borderRadius: 6, color: "#ff9090", padding: "4px 10px", fontSize: "0.8rem", cursor: "pointer" }}
+          >
+            Retry now
+          </button>
+        </div>
+      )}
+
+      {/* Error */}
+      {status === "error" && retryIn === null && (
+        <div style={{ textAlign: "center", color: "#ff4d4d", padding: "32px 20px", fontSize: "0.9rem" }}>
+          {errorMsg}
+        </div>
+      )}
+
+      {/* Loading skeleton */}
+      {isLoading && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {[1,2,3,4,5].map(i => (
+            <div key={i} style={{ background: "#161b22", borderRadius: 10, padding: "14px 16px", borderLeft: "5px solid #21262d", opacity: 1 - i * 0.12 }}>
+              <div style={{ height: 14, width: "35%", background: "#21262d", borderRadius: 4, marginBottom: 10 }} />
+              <div style={{ height: 11, width: "90%", background: "#21262d", borderRadius: 4, marginBottom: 6 }} />
+              <div style={{ height: 11, width: "75%", background: "#21262d", borderRadius: 4 }} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!isLoading && status === "idle" && allCves.length === 0 && (
+        <div style={{ textAlign: "center", color: "#7d8590", padding: "48px 20px" }}>
+          No CVEs found for the selected date range.
+        </div>
+      )}
+
+      {!isLoading && status === "idle" && allCves.length > 0 && filtered.length === 0 && (
+        <div style={{ textAlign: "center", color: "#7d8590", padding: "48px 20px" }}>
+          No CVEs match the current filters.
+        </div>
+      )}
+
+      {/* Cards */}
+      {!isLoading && filtered.map(item => (
+        <CVECard key={item.cve.id} item={item} />
+      ))}
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        a:hover { text-decoration: underline; }
+        input:focus { border-color: #388bfd !important; }
+        select:focus { border-color: #388bfd !important; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #0d1117; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+      `}</style>
+    </div>
+  );
+}
